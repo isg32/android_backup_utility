@@ -1,6 +1,6 @@
 # abu — Android Backup Utility
 
-Back up your Android phone's internal storage (`/sdcard`) over **adb**. abu has a terminal UI. It checks every file it copies and can pick up where it stopped after a pause, a pulled cable or a crash.
+Back up your Android phone's internal storage (`/sdcard`) over **adb**, and **restore** it again later. abu has a terminal UI. It checks every file it copies and can pick up where it stopped after a pause, a pulled cable or a crash.
 
 ![Folder picker](docs/screenshots/01-select.png)
 
@@ -12,6 +12,7 @@ Back up your Android phone's internal storage (`/sdcard`) over **adb**. abu has 
 - **Survives disconnects.** If the phone drops off, abu waits for it to come back and retries the file.
 - **Resumes after a crash.** Progress is saved per file. Run abu again into the same folder and it carries on.
 - **Updates an old backup.** Running it again into an earlier backup folder only copies new or changed files.
+- **Restore with `abu restore`.** Push a backup back onto the phone or onto a new phone. Files already there are skipped, and files that differ are kept unless you choose to overwrite them.
 - **Quick with small files.** Small files from the same folder are copied in batches, so folders with thousands of thumbnails are not slowed down by per-file overhead.
 
 ---
@@ -24,6 +25,7 @@ Back up your Android phone's internal storage (`/sdcard`) over **adb**. abu has 
 - [The folder picker](#the-folder-picker)
 - [The backup screen](#the-backup-screen)
 - [Interruptions, resuming and updating a backup](#interruptions-resuming-and-updating-a-backup)
+- [Restoring a backup](#restoring-a-backup)
 - [Command-line reference](#command-line-reference)
 - [Where things are saved](#where-things-are-saved)
 - [Troubleshooting](#troubleshooting)
@@ -170,16 +172,59 @@ Running abu again later into an old backup folder works the same way. Only new o
 
 > abu never deletes files from your backup, even if you deleted them on the phone. It only adds and updates.
 
+## Restoring a backup
+
+```bash
+abu restore ~/PhoneBackup                 # push it back into /sdcard on the connected phone
+abu restore ~/PhoneBackup --to /sdcard/Restored/   # or into another folder
+abu restore ~/PhoneBackup --overwrite     # replace phone files that differ from the backup
+```
+
+abu reads the backup folder and scans the phone. It then opens the same folder picker, with each row marked to show how it compares with the phone:
+
+![Restore picker](docs/screenshots/09-restore-select.png)
+
+| Label | Meaning |
+| --- | --- |
+| `new` (green) | Not on the phone yet. It will be pushed |
+| `✓ on device` (grey) | Already on the phone with the same size. Skipped |
+| `≠ differs on device` (yellow) | A file with the same path but a different size is on the phone. **Kept as it is** unless overwrite is on |
+| `N new · N differ · N on device` | The same counts, totalled for each folder |
+
+Press **`o`** in the picker, or pass `--overwrite`, to switch between *keep the phone's copy* (the default) and *overwrite*.
+Before anything is written, abu shows exactly what it will do:
+
+![Restore confirmation](docs/screenshots/10-restore-confirm.png)
+
+The restore runs on the same screen as a backup, with the same pause, reconnect, quit and resume behaviour:
+
+![Restore running](docs/screenshots/11-restore-running.png)
+
+![Restore complete](docs/screenshots/12-restore-complete.png)
+
+How the restore keeps your phone safe:
+
+- **Nothing half-written is left on the phone.** Each file is first pushed into a hidden staging folder on the phone, `<target>/.abu-staging/`, which contains a `.nomedia` file. Its size is checked there, plus MD5 with `--verify-hash`, and only then is it moved into place. A broken transfer never leaves a truncated photo in your gallery or replaces a good file with a damaged one.
+- **Original modified times are kept**, so the gallery keeps photos in date order.
+- **Nothing is deleted from the phone.** Files that differ are left alone unless you opt in to overwriting.
+- **The gallery updates afterwards.** When the restore finishes, abu asks Android to rescan storage so restored photos, videos and music show up in apps.
+- **Resumable.** Progress is saved in `<backup>/.abu/restore.db`. Run `abu restore` again on the same folder to resume. The target folder is remembered, so you don't need to pass `--to` again.
+- Files that differ are listed in `.abu/restore-conflicts.txt`, and failed files in `.abu/restore-failed.txt`.
+
+> **`Android/` and restore:** on Android 11 and later, adb can't write into other apps' `Android/data` folders, so that folder is unticked by default here too.
+
 ## Command-line reference
 
 ```
-abu [OUTPUT_DIR] [-s SERIAL] [--verify-hash] [--retries N]
-    [--include-android] [--resume | --new] [-V]
+abu [backup] [OUTPUT_DIR] [options]        # back up (default command)
+abu restore BACKUP_DIR [--to DIR] [--overwrite] [options]
 ```
+
+Options for both commands:
 
 | Option | Description |
 | --- | --- |
-| `OUTPUT_DIR` | Where to save the backup. Default: `./backups/<model>_<serial>/`. Use the same folder to resume or update a backup. |
+| `OUTPUT_DIR` | *(backup)* Where to save the backup. Default: `./backups/<model>_<serial>/`. Use the same folder to resume or update a backup. |
 | `-s, --serial SERIAL` | Which device to use when several are connected. Without it, abu asks. |
 | `--verify-hash` | Also compare MD5 checksums from the phone and the computer for every file. This is the strongest check, and noticeably slower on large files. |
 | `--retries N` | Attempts per file before it is marked failed (default `3`). Disconnects don't count. |
@@ -187,6 +232,14 @@ abu [OUTPUT_DIR] [-s SERIAL] [--verify-hash] [--retries N]
 | `--resume` | If there is an unfinished backup, resume it without asking. |
 | `--new` | Ignore unfinished work and go straight to scanning and the picker. |
 | `-V, --version` | Print the version. |
+
+Restore only:
+
+| Option | Description |
+| --- | --- |
+| `BACKUP_DIR` | A folder created by `abu backup`. Any folder laid out like `/sdcard` works. |
+| `--to DIR` | Folder on the phone to restore into. Default: `/sdcard/`, or the folder used last time when resuming. |
+| `--overwrite` | Replace phone files whose size differs from the backup. Without it, those files are kept as they are and reported as conflicts. |
 
 ## Where things are saved
 
@@ -197,7 +250,10 @@ abu [OUTPUT_DIR] [-s SERIAL] [--verify-hash] [--retries N]
 ├── Download/…
 └── .abu/
     ├── state.db                  ← per-file progress (SQLite)
-    ├── failed.txt                ← files that failed, with the error (if any)
+    ├── failed.txt                ← files that failed to back up, with the error (if any)
+    ├── restore.db                ← restore progress (only after `abu restore`)
+    ├── restore-failed.txt        ← files that failed to restore
+    ├── restore-conflicts.txt     ← files that differ on the phone and were left alone
     └── staging/                  ← temporary folder for batch copies (removed after each batch)
 ```
 
@@ -213,6 +269,8 @@ abu [OUTPUT_DIR] [-s SERIAL] [--verify-hash] [--retries N]
 | Some files under `Android/data` are missing | On Android 11 and later, adb can't read other apps' private folders. This is an Android restriction, not something abu can work around. |
 | Some files fail with "file no longer exists on device" | The file was deleted between the scan and the copy, which happens with caches and thumbnails. This is harmless. |
 | Copies are slow | Use a USB 3 cable and port. A phone that is locked with the screen off sometimes slows USB down. Leave `--verify-hash` off unless you need it. |
+| Restored photos don't show up in the gallery | abu asks Android to rescan at the end. If that is blocked on your phone, reboot it, or open the gallery app and wait a minute for it to index. |
+| Restore reports many files that differ on the phone | Those files were changed on the phone after the backup. Look at `.abu/restore-conflicts.txt`, then re-run with `--overwrite` if you want the backup versions. |
 | You want to start completely from scratch | Delete `<output>/.abu/`, or choose a new output folder. |
 
 ---

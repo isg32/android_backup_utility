@@ -1,4 +1,6 @@
-"""Backup engine: pulls files one by one, verifies them, survives pauses and disconnects."""
+"""Transfer engines. `TransferEngine` holds what backup and restore share: the worker
+thread, pause/stop, progress stats, running adb with suspend support, waiting for
+the device and batching. `BackupEngine` pulls files from the device."""
 
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from .adb import Adb
+from .model import plural
 from .state import DONE, FAILED, PENDING, Item, StateDB
 
 PART_SUFFIX = ".abu-part"
@@ -27,7 +30,7 @@ BATCH_MAX_BYTES = 64 << 20
 
 @dataclass
 class Stats:
-    state: str = "idle"  # idle | running | paused | waiting | done | stopped
+    state: str = "idle"  # idle | scanning | running | verifying | paused | waiting | done | stopped
     total_files: int = 0
     total_bytes: int = 0
     done_files: int = 0
@@ -35,6 +38,7 @@ class Stats:
     failed_files: int = 0
     skipped_files: int = 0
     copied_files: int = 0
+    conflict_files: int = 0
     current_rel: str = ""
     current_size: int = 0
     current_bytes: int = 0
@@ -66,14 +70,14 @@ class Stats:
         return (self.total_bytes - self.progress_bytes) / spd
 
 
-class BackupEngine(threading.Thread):
-    def __init__(self, adb: Adb, db: StateDB, out_dir: Path, root: str = "/sdcard/",
-                 verify_hash: bool = False, retries: int = 3) -> None:
+class TransferEngine(threading.Thread):
+    """Common machinery for moving files between the computer and the device."""
+
+    def __init__(self, adb: Adb, db: StateDB, verify_hash: bool = False,
+                 retries: int = 3) -> None:
         super().__init__(daemon=True, name="abu-engine")
         self.adb = adb
         self.db = db
-        self.out_dir = out_dir
-        self.root = root.rstrip("/") + "/"
         self.verify_hash = verify_hash
         self.retries = retries
         self.stats = Stats()
@@ -100,52 +104,18 @@ class BackupEngine(threading.Thread):
     def log(self, level: str, msg: str) -> None:
         self.events.put((level, msg))
 
-    # ------------------------------------------------------------------ main
-    def run(self) -> None:
-        s = self.stats
-        try:
-            items = self.db.selected_items()
-            s.total_files = len(items)
-            s.total_bytes = sum(i.size for i in items)
-            todo: list[Item] = []
-            for it in items:
-                if it.status == DONE and self._local_ok(it):
-                    s.done_files += 1
-                    s.done_bytes += it.size
-                else:
-                    if it.status == DONE:  # local copy vanished/changed: redo
-                        self.db.mark(it.rel, PENDING)
-                    todo.append(it)
-            if s.done_files:
-                self.log("info", f"{s.done_files:,} files already backed up — skipping them.")
-            s.state = "running"
-            s.started = time.monotonic()
-            for job in self._jobs(todo):
-                if self._stop.is_set():
-                    break
-                if len(job) == 1:
-                    self._process(job[0])
-                else:
-                    self._process_batch(job)
-            s.current_rel, s.current_bytes, s.current_size = "", 0, 0
-            s.state = "stopped" if self._stop.is_set() else "done"
-        except Exception as e:  # pragma: no cover - surfaced in UI
-            self.log("error", f"Engine crashed: {e!r}")
-            s.state = "stopped"
-
-    # ------------------------------------------------------------- batching
-    def _jobs(self, todo: list[Item]):
+    # ----------------------------------------------------------------- shared
+    @staticmethod
+    def group_jobs(todo: list[Item]):
         """Yield single large files, or batches of small files sharing a folder.
 
-        One `adb pull` per small file is dominated by process start-up and
-        connection overhead; pulling many at once is several times faster.
+        One adb invocation per small file is dominated by process start-up and
+        connection overhead; moving many at once is several times faster.
         """
         todo = sorted(todo, key=lambda i: (os.path.dirname(i.rel), i.rel))
         batch: list[Item] = []
         batch_bytes = 0
         for it in todo:
-            if self._already_present(it):
-                continue
             parent = os.path.dirname(it.rel)
             small = it.size <= BATCH_FILE_MAX
             if batch and (
@@ -164,6 +134,135 @@ class BackupEngine(threading.Thread):
         if batch:
             yield batch
 
+    def _count_done(self, it: Item, copied: bool) -> None:
+        s = self.stats
+        s.done_files += 1
+        s.done_bytes += it.size
+        if copied:
+            s.session_bytes += it.size
+            s.copied_files += 1
+        else:
+            s.skipped_files += 1
+
+    def _wait_while_paused(self) -> None:
+        if not self._pause.is_set():
+            return
+        prev = self.stats.state
+        self.stats.state = "paused"
+        while self._pause.is_set() and not self._stop.is_set():
+            self.stats.sample()
+            time.sleep(0.1)
+        self.stats.state = prev if prev != "paused" else "running"
+
+    def _wait_for_device(self) -> None:
+        self.stats.state = "waiting"
+        self.log("warn", "Device disconnected — waiting for it to come back…")
+        while not self._stop.is_set():
+            self._wait_while_paused()
+            if self.adb.is_connected():
+                self.log("ok", "Device reconnected — resuming.")
+                break
+            time.sleep(1)
+        self.stats.state = "running"
+
+    def _fail(self, it: Item, attempts: int, err: str) -> None:
+        self.db.mark(it.rel, FAILED, error=err[:500], attempts=attempts)
+        self.stats.failed_files += 1
+        self.stats.done_bytes += it.size  # count it as "processed" for the bar
+        self.stats.current_bytes = 0
+        self.log("error", f"FAILED: {it.rel} — {err}")
+
+    def _run_adb(self, proc: subprocess.Popen, measure: Callable[[], int],
+                 measure_every: int = 1) -> tuple[bool, str]:
+        """Babysit an adb transfer: progress, pause (SIGSTOP/SIGCONT) and stop."""
+        s = self.stats
+        self._proc = proc
+        suspended = False
+        tick = 0
+        try:
+            while proc.poll() is None:
+                if self._stop.is_set():
+                    if suspended:
+                        _signal(proc, signal.SIGCONT)
+                    proc.terminate()
+                    try:
+                        proc.wait(3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return False, "stopped"
+                if self._pause.is_set():
+                    if CAN_SUSPEND and not suspended:
+                        _signal(proc, signal.SIGSTOP)
+                        suspended = True
+                    elif not CAN_SUSPEND:  # no SIGSTOP: abort and restart the file
+                        proc.terminate()
+                        proc.wait()
+                        self._wait_while_paused()
+                        return False, "paused"
+                    s.state = "paused"
+                else:
+                    if suspended:
+                        _signal(proc, signal.SIGCONT)
+                        suspended = False
+                        s.state = "running"
+                    if tick % measure_every == 0:
+                        s.current_bytes = measure()
+                tick += 1
+                s.sample()
+                time.sleep(0.1)
+            err = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace")
+            err = " ".join(err.split())[-300:]
+            return proc.returncode == 0, err or f"adb exited with {proc.returncode}"
+        finally:
+            self._proc = None
+            if proc.stderr:
+                proc.stderr.close()
+
+
+class BackupEngine(TransferEngine):
+    """Pulls the selected files from the device into `out_dir`."""
+
+    def __init__(self, adb: Adb, db: StateDB, out_dir: Path, root: str = "/sdcard/",
+                 verify_hash: bool = False, retries: int = 3) -> None:
+        super().__init__(adb, db, verify_hash, retries)
+        self.out_dir = out_dir
+        self.root = root.rstrip("/") + "/"
+
+    # ------------------------------------------------------------------ main
+    def run(self) -> None:
+        s = self.stats
+        try:
+            items = self.db.selected_items()
+            s.total_files = len(items)
+            s.total_bytes = sum(i.size for i in items)
+            todo: list[Item] = []
+            for it in items:
+                if it.status == DONE and self._local_ok(it):
+                    s.done_files += 1
+                    s.done_bytes += it.size
+                else:
+                    if it.status == DONE:  # local copy vanished/changed: redo
+                        self.db.mark(it.rel, PENDING)
+                    todo.append(it)
+            if s.done_files:
+                self.log("info", f"{plural(s.done_files, 'file')} already backed up — skipping.")
+            s.state = "running"
+            s.started = time.monotonic()
+            todo = [it for it in todo if not self._already_present(it)]
+            for job in self.group_jobs(todo):
+                if self._stop.is_set():
+                    break
+                if len(job) == 1:
+                    self._process(job[0])
+                else:
+                    self._process_batch(job)
+            s.current_rel, s.current_bytes, s.current_size = "", 0, 0
+            s.state = "stopped" if self._stop.is_set() else "done"
+        except Exception as e:  # pragma: no cover - surfaced in UI
+            self.log("error", f"Engine crashed: {e!r}")
+            s.state = "stopped"
+
+    # ------------------------------------------------------------- per file
     def _already_present(self, it: Item) -> bool:
         """Identical file (size + mtime) already on disk, e.g. from an older backup."""
         try:
@@ -172,9 +271,7 @@ class BackupEngine(threading.Thread):
             return False
         if st.st_size == it.size and int(st.st_mtime) == it.mtime:
             self.db.mark(it.rel, DONE, attempts=it.attempts)
-            self.stats.done_files += 1
-            self.stats.done_bytes += it.size
-            self.stats.skipped_files += 1
+            self._count_done(it, copied=False)
             return True
         return False
 
@@ -187,11 +284,7 @@ class BackupEngine(threading.Thread):
         except OSError:
             pass
         self.db.mark(it.rel, DONE, attempts=attempts, size=it.size)
-        s = self.stats
-        s.done_files += 1
-        s.done_bytes += it.size
-        s.session_bytes += it.size
-        s.copied_files += 1
+        self._count_done(it, copied=True)
 
     def _process_batch(self, items: list[Item]) -> None:
         s = self.stats
@@ -254,27 +347,6 @@ class BackupEngine(threading.Thread):
             return False
         return st.st_size == it.size
 
-    def _wait_while_paused(self) -> None:
-        if not self._pause.is_set():
-            return
-        prev = self.stats.state
-        self.stats.state = "paused"
-        while self._pause.is_set() and not self._stop.is_set():
-            self.stats.sample()
-            time.sleep(0.1)
-        self.stats.state = prev if prev != "paused" else "running"
-
-    def _wait_for_device(self) -> None:
-        self.stats.state = "waiting"
-        self.log("warn", "Device disconnected — waiting for it to come back…")
-        while not self._stop.is_set():
-            self._wait_while_paused()
-            if self.adb.is_connected():
-                self.log("ok", "Device reconnected — resuming.")
-                break
-            time.sleep(1)
-        self.stats.state = "running"
-
     # --------------------------------------------------------------- process
     def _process(self, it: Item) -> None:
         s = self.stats
@@ -325,54 +397,9 @@ class BackupEngine(threading.Thread):
         _unlink(part)
         self.db.mark(it.rel, PENDING, attempts=attempts)
 
-    def _fail(self, it: Item, attempts: int, err: str) -> None:
-        self.db.mark(it.rel, FAILED, error=err[:500], attempts=attempts)
-        self.stats.failed_files += 1
-        self.stats.done_bytes += it.size  # count it as "processed" for the bar
-        self.stats.current_bytes = 0
-        self.log("error", f"FAILED: {it.rel} — {err}")
-
     def _pull(self, remotes: list[str], dest: Path,
               measure: Callable[[], int]) -> tuple[bool, str]:
-        s = self.stats
-        proc = self.adb.pull_process(remotes, str(dest))
-        self._proc = proc
-        suspended = False
-        try:
-            while proc.poll() is None:
-                if self._stop.is_set():
-                    if suspended:
-                        _signal(proc, signal.SIGCONT)
-                    proc.terminate()
-                    try:
-                        proc.wait(3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    return False, "stopped"
-                if self._pause.is_set():
-                    if CAN_SUSPEND and not suspended:
-                        _signal(proc, signal.SIGSTOP)
-                        suspended = True
-                    elif not CAN_SUSPEND:  # no SIGSTOP: abort and restart the file
-                        proc.terminate()
-                        proc.wait()
-                        self._wait_while_paused()
-                        return False, "paused"
-                    s.state = "paused"
-                elif suspended:
-                    _signal(proc, signal.SIGCONT)
-                    suspended = False
-                    s.state = "running"
-                s.current_bytes = measure()
-                s.sample()
-                time.sleep(0.1)
-            err = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace")
-            err = " ".join(err.split())[-300:]
-            return proc.returncode == 0, err or f"adb exited with {proc.returncode}"
-        finally:
-            self._proc = None
-            if proc.stderr:
-                proc.stderr.close()
+        return self._run_adb(self.adb.pull_process(remotes, str(dest)), measure)
 
     def _verify(self, it: Item, remote: str, part: Path) -> tuple[bool, str]:
         try:

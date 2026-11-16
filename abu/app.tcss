@@ -63,7 +63,7 @@ ProgressBar Bar > .bar--complete { color: #50fa7b; }
 }
 
 /* ---------- dialogs ---------- */
-ResumeModal, DevicePicker, ConfirmQuit { align: center middle; background: #00000099; }
+ResumeModal, DevicePicker, Confirm { align: center middle; background: #00000099; }
 #dialog {
     width: 64;
     height: auto;

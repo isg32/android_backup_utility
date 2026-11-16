@@ -11,7 +11,7 @@ from typing import Iterable
 
 from .adb import RemoteFile
 
-PENDING, DONE, FAILED = "pending", "done", "failed"
+PENDING, DONE, FAILED, CONFLICT = "pending", "done", "failed", "conflict"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -128,11 +128,12 @@ class StateDB:
             ).fetchall()
         return {s: (n, b) for s, n, b in rows}
 
-    def failed(self) -> list[tuple[str, str]]:
+    def listing(self, status: str) -> list[tuple[str, str]]:
+        """(rel, error) for selected files with the given status."""
         with self._lock:
             return self.conn.execute(
                 "SELECT rel, COALESCE(error,'') FROM files "
-                "WHERE selected=1 AND status='failed' ORDER BY rel"
+                "WHERE selected=1 AND status=? ORDER BY rel", (status,)
             ).fetchall()
 
     # ---------------------------------------------------------------- update

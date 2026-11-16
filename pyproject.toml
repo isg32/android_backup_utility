@@ -1,7 +1,7 @@
 [project]
 name = "android-backup-utility"
-version = "0.1.0"
-description = "Resumable adb backup of an Android device's /sdcard, with a TUI folder picker"
+version = "0.2.0"
+description = "Resumable adb backup and restore of an Android device's /sdcard, with a TUI folder picker"
 requires-python = ">=3.10"
 dependencies = ["textual>=0.80"]
 

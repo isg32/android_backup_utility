@@ -152,6 +152,49 @@ class Adb:
                 result[path] = digest
         return result
 
+    def stat_many(self, remotes: list[str]) -> dict[str, tuple[int, int]]:
+        """path -> (size, mtime) for each of `remotes` that exists."""
+        if not remotes:
+            return {}
+        cmd = ("stat -c '%s|%Y|%n' " + " ".join(shlex.quote(r) for r in remotes)
+               + " 2>/dev/null")
+        res = self.run("exec-out", cmd, timeout=60)
+        out: dict[str, tuple[int, int]] = {}
+        for line in res.stdout.splitlines():
+            parts = line.split("|", 2)
+            if len(parts) == 3:
+                try:
+                    out[parts[2]] = (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    pass
+        return out
+
+    def dir_size(self, remote_dir: str) -> int:
+        """Total size of regular files directly inside `remote_dir` (0 on error)."""
+        cmd = f"find {shlex.quote(remote_dir)} -type f -exec stat -c %s {{}} + 2>/dev/null"
+        try:
+            res = self.run("exec-out", cmd, timeout=10)
+            return sum(int(x) for x in res.stdout.split() if x.isdigit())
+        except Exception:
+            return 0
+
+    def push_process(self, locals_: list[str], remote: str) -> subprocess.Popen[bytes]:
+        """`adb push` one or more local files into existing remote directory `remote`."""
+        return subprocess.Popen(
+            self._cmd("push", *locals_, remote),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    def media_scan(self) -> bool:
+        """Ask MediaProvider to rescan shared storage so restored media shows up."""
+        try:
+            self.shell("content call --uri content://media --method scan_volume "
+                       "--arg external_primary", timeout=120)
+            return True
+        except Exception:
+            return False
+
     def pull_process(self, remotes: list[str], local: str) -> subprocess.Popen[bytes]:
         """`adb pull` one file to `local`, or several files into directory `local`."""
         return subprocess.Popen(

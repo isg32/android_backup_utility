@@ -130,3 +130,7 @@ def human_time(seconds: float | None) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}h {m:02d}m" if h else f"{m:02d}:{s:02d}"
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n:,} {word}" + ("" if n == 1 else "s")

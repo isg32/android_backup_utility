@@ -1,10 +1,11 @@
-"""Textual TUI: device check -> (resume?) -> scan -> folder picker -> backup."""
+"""Textual TUI: device check -> (resume?) -> scan -> folder picker -> backup/restore."""
 
 from __future__ import annotations
 
 import re
 import time
 from pathlib import Path
+from typing import Callable
 
 from rich.style import Style
 from rich.text import Text
@@ -22,9 +23,11 @@ from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from .adb import Adb, AdbError, RemoteFile
-from .engine import BackupEngine
-from .model import ALL, NONE, PARTIAL, FsNode, build_tree, find, human_size, human_time
-from .state import StateDB
+from .engine import BackupEngine, TransferEngine
+from .model import (ALL, NONE, PARTIAL, FsNode, build_tree, find, human_size,
+                    human_time, plural)
+from .restore import RestoreEngine, scan_local
+from .state import CONFLICT, FAILED, StateDB
 
 ROOT = "/sdcard/"
 ANDROID_DIR = "Android"
@@ -38,7 +41,7 @@ class CheckTree(Tree[FsNode]):
         Binding("right,l", "open", "Open", show=True),
         Binding("left,h", "close", "Close", show=True),
         Binding("space", "check", "Toggle", show=True),
-        Binding("enter", "screen.start", "Start backup", show=True),
+        Binding("enter", "screen.start", "Start", show=True),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
     ]
@@ -46,8 +49,10 @@ class CheckTree(Tree[FsNode]):
     ICON_NODE = "▸ "
     ICON_NODE_EXPANDED = "▾ "
 
-    def __init__(self, root: FsNode, **kw) -> None:
+    def __init__(self, root: FsNode,
+                 annotate: Callable[[FsNode], Text | None] | None = None, **kw) -> None:
         super().__init__(root.name, data=root, **kw)
+        self.annotate = annotate
         self.auto_expand = False
         self.guide_depth = 3
         self._loaded: set[int] = set()
@@ -130,6 +135,10 @@ class CheckTree(Tree[FsNode]):
             text.append(f"  {fs.count:,} files", "#6272a4")
             if state == PARTIAL:
                 text.append(f"  ({human_size(fs.sel_size)} selected)", "#f1fa8c dim")
+        if self.annotate:
+            extra = self.annotate(fs)
+            if extra:
+                text.append_text(extra)
         if fs.rel == ANDROID_DIR:
             text.append("  app data — off by default", "italic #ff79c6")
         return text
@@ -147,7 +156,7 @@ class ResumeModal(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("⟲  Unfinished backup found", id="dialog-title")
+            yield Label(f"↻  Unfinished {self.app.mode} found", id="dialog-title")
             yield Static(self.summary, id="dialog-body")
             with Horizontal(id="dialog-buttons"):
                 yield Button("Resume", variant="success", id="resume")
@@ -174,20 +183,21 @@ class DevicePicker(ModalScreen[str]):
         self.dismiss(event.option.id)
 
 
-class ConfirmQuit(ModalScreen[bool]):
+class Confirm(ModalScreen[bool]):
     BINDINGS = [Binding("y", "yes", "Yes"), Binding("n,escape", "no", "No")]
+
+    def __init__(self, title: str, body: str, yes: str, no: str,
+                 yes_variant: str = "error") -> None:
+        super().__init__()
+        self.t, self.body, self.yes, self.no, self.yes_variant = title, body, yes, no, yes_variant
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Stop the backup?", id="dialog-title")
-            yield Static(
-                "Progress is saved per file. Run the tool again with the same\n"
-                "output folder to resume exactly where you left off.",
-                id="dialog-body",
-            )
+            yield Label(self.t, id="dialog-title")
+            yield Static(self.body, id="dialog-body")
             with Horizontal(id="dialog-buttons"):
-                yield Button("Stop & quit", variant="error", id="yes")
-                yield Button("Keep going", variant="primary", id="no")
+                yield Button(self.yes, variant=self.yes_variant, id="yes")  # type: ignore[arg-type]
+                yield Button(self.no, variant="primary", id="no")
 
     def action_yes(self) -> None:
         self.dismiss(True)
@@ -226,18 +236,26 @@ class SelectScreen(Screen):
     BINDINGS = [
         Binding("a", "toggle_all", "All/None"),
         Binding("A", "toggle_android", "Android dir"),
-        Binding("s", "start", "Start backup"),
+        Binding("o", "toggle_overwrite", "Overwrite"),
+        Binding("s", "start", "Start"),
         Binding("q", "app.quit", "Quit"),
     ]
 
-    def __init__(self, root: FsNode) -> None:
+    def __init__(self, root: FsNode,
+                 annotate: Callable[[FsNode], Text | None] | None = None) -> None:
         super().__init__()
         self.fs_root = root
+        self.annotate = annotate
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "toggle_overwrite":
+            return self.app.mode == "restore"
+        return True
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(id="sel-summary")
-        yield CheckTree(self.fs_root, id="tree")
+        yield CheckTree(self.fs_root, self.annotate, id="tree")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -246,12 +264,22 @@ class SelectScreen(Screen):
 
     @on(SelectionChanged)
     def update_summary(self) -> None:
-        r = self.fs_root
-        self.query_one("#sel-summary", Static).update(
-            f" [b #50fa7b]{human_size(r.sel_size)}[/] selected in "
-            f"[b]{r.sel_count:,}[/] files   [dim]of {human_size(r.size)} / "
-            f"{r.count:,} files on device[/]   →  [#8be9fd]{self.app.out_dir}[/]"
-        )
+        r, app = self.fs_root, self.app
+        head = (f" [b #50fa7b]{human_size(r.sel_size)}[/] selected in "
+                f"[b]{r.sel_count:,}[/] files   ")
+        if app.mode == "backup":
+            text = (head + f"[dim]of {human_size(r.size)} / {r.count:,} files on device[/]"
+                    f"   →  [#8be9fd]{app.out_dir}[/]")
+        else:
+            mode = ("[b #ff5555]overwrite[/]" if app.overwrite else "[b #8be9fd]keep device copy[/]")
+            text = (head + f"[dim]of {human_size(r.size)} / {r.count:,} files in backup[/]"
+                    f"   →  [#8be9fd]device:{app.remote_root}[/]\n"
+                    f" Files that differ on the device: {mode} [dim](press o to change)[/]")
+        self.query_one("#sel-summary", Static).update(text)
+
+    def action_toggle_overwrite(self) -> None:
+        self.app.overwrite = not self.app.overwrite
+        self.update_summary()
 
     def action_toggle_all(self) -> None:
         self.fs_root.toggle()
@@ -267,7 +295,7 @@ class SelectScreen(Screen):
         if self.fs_root.sel_count == 0:
             self.notify("Nothing selected.", severity="warning")
             return
-        self.app.start_backup_from_selection()
+        self.app.start_from_selection()
 
 
 class BackupScreen(Screen):
@@ -277,7 +305,7 @@ class BackupScreen(Screen):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, engine: BackupEngine) -> None:
+    def __init__(self, engine: TransferEngine) -> None:
         super().__init__()
         self.engine = engine
         self._finished = False
@@ -298,9 +326,13 @@ class BackupScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#bk-dest", Static).update(
-            f"[dim]{self.app.device_label}  →[/]  [#8be9fd]{self.app.out_dir}[/]"
-        )
+        app = self.app
+        if app.mode == "backup":
+            route = f"[dim]{app.device_label}  →[/]  [#8be9fd]{app.out_dir}[/]"
+        else:
+            route = (f"[#8be9fd]{app.out_dir}[/]  [dim]→  {app.device_label}:[/]"
+                     f"[#8be9fd]{app.remote_root}[/]")
+        self.query_one("#bk-dest", Static).update(route)
         self.set_interval(0.2, self.refresh_stats)
         if not self.engine.is_alive():
             self.engine.start()
@@ -315,6 +347,7 @@ class BackupScreen(Screen):
 
         badge = {
             "idle": ("PREPARING", "#6272a4"),
+            "scanning": ("◌ CHECKING DEVICE", "#8be9fd"),
             "running": ("● RUNNING", "#50fa7b"),
             "verifying": ("● VERIFYING", "#8be9fd"),
             "paused": ("❚❚ PAUSED", "#f1fa8c"),
@@ -329,7 +362,7 @@ class BackupScreen(Screen):
         self.query_one("#bar-total", ProgressBar).update(
             total=max(s.total_bytes, 1), progress=min(s.progress_bytes, s.total_bytes)
         )
-        processed = s.done_files + s.failed_files
+        processed = s.done_files + s.failed_files + s.conflict_files
         stats = (
             f"[b]{processed:,}[/]/{s.total_files:,} files   "
             f"[#ffb86c]{human_size(s.progress_bytes)}[/] / {human_size(s.total_bytes)}   "
@@ -339,7 +372,10 @@ class BackupScreen(Screen):
         if s.copied_files:
             extras.append(f"[#50fa7b]✔ {s.copied_files:,} copied[/]")
         if s.skipped_files or (s.done_files - s.copied_files):
-            extras.append(f"[#6272a4]↷ {s.done_files - s.copied_files:,} already present[/]")
+            where = "already present" if self.app.mode == "backup" else "already on device"
+            extras.append(f"[#6272a4]↷ {s.done_files - s.copied_files:,} {where}[/]")
+        if s.conflict_files:
+            extras.append(f"[#f1fa8c]≠ {s.conflict_files:,} differ on device (kept)[/]")
         if s.failed_files:
             extras.append(f"[#ff5555]✘ {s.failed_files:,} failed[/]")
         if extras:
@@ -367,17 +403,27 @@ class BackupScreen(Screen):
     def on_finished(self) -> None:
         log = self.query_one(RichLog)
         s = self.engine.stats
-        failed = self.app.db.failed()
+        app = self.app
+        restore = app.mode == "restore"
+        failed = app.db.listing(FAILED)
+        report = app.out_dir / ".abu" / ("restore-failed.txt" if restore else "failed.txt")
         if failed:
-            report = self.app.out_dir / ".abu" / "failed.txt"
             report.write_text("".join(f"{r}\t{err}\n" for r, err in failed))
+        conflicts = app.db.listing(CONFLICT) if restore else []
+        conflict_report = app.out_dir / ".abu" / "restore-conflicts.txt"
+        if conflicts:
+            conflict_report.write_text("".join(f"{r}\t{err}\n" for r, err in conflicts))
         if s.state == "done":
             elapsed = human_time(time.monotonic() - s.started)
             log.write(
-                f"\n[b #50fa7b]Backup finished[/] in {elapsed}: "
-                f"{s.copied_files:,} copied, {s.done_files - s.copied_files:,} already present, "
+                f"\n[b #50fa7b]{'Restore' if restore else 'Backup'} finished[/] in {elapsed}: "
+                f"{s.copied_files:,} copied, {s.done_files - s.copied_files:,} "
+                f"{'already on device' if restore else 'already present'}, "
                 f"[#ff5555]{s.failed_files:,} failed[/]."
             )
+            if conflicts:
+                log.write(f"[#f1fa8c]{plural(len(conflicts), 'file')} differ on the device and were left "
+                          f"untouched — see {conflict_report}. Re-run with --overwrite to replace them.[/]")
             if failed:
                 log.write(f"[#f1fa8c]Failed files listed in {report}. Press [b]r[/] to retry them.[/]")
             else:
@@ -413,7 +459,12 @@ class BackupScreen(Screen):
             if yes:
                 self.app.stop_engine_and_exit()
 
-        self.app.push_screen(ConfirmQuit(), done)
+        what = "restore" if self.app.mode == "restore" else "backup"
+        self.app.push_screen(Confirm(
+            f"Stop the {what}?",
+            "Progress is saved per file. Run the same command again to resume\n"
+            "exactly where you left off.",
+            "Stop & quit", "Keep going"), done)
 
 
 # ===================================================================== app
@@ -423,8 +474,15 @@ class AbuApp(App):
     BINDINGS = [Binding("ctrl+c", "quit_safely", "Quit", show=False, priority=True)]
 
     def __init__(self, out_dir: Path | None, serial: str | None, verify_hash: bool,
-                 retries: int, include_android: bool, auto_resume: bool | None) -> None:
+                 retries: int, include_android: bool, auto_resume: bool | None,
+                 mode: str = "backup", remote_root: str | None = None,
+                 overwrite: bool = False) -> None:
         super().__init__()
+        self.mode = mode  # "backup" | "restore"
+        self.remote_root_arg = remote_root
+        self.remote_root = ROOT
+        self.overwrite = overwrite
+        self.remote_files: dict[str, tuple[int, int]] | None = None
         self.out_dir_arg = out_dir
         self.serial = serial
         self.verify_hash = verify_hash
@@ -437,7 +495,7 @@ class AbuApp(App):
         self.device_label = ""
         self.files: list[RemoteFile] = []
         self.fs_root: FsNode | None = None
-        self.engine: BackupEngine | None = None
+        self.engine: TransferEngine | None = None
 
     # ------------------------------------------------------------- startup
     def on_mount(self) -> None:
@@ -497,10 +555,19 @@ class AbuApp(App):
             safe = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{model}_{self.serial}")
             out = Path.cwd() / "backups" / safe
         self.out_dir = out.expanduser().resolve()
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.db = StateDB(self.out_dir / ".abu" / "state.db")
+        if self.mode == "restore":
+            if not self.out_dir.is_dir():
+                self.call_from_thread(self.fatal, "Backup folder not found", str(self.out_dir))
+                return
+            self.db = StateDB(self.out_dir / ".abu" / "restore.db")
+            root = self.remote_root_arg or self.db.get_meta("remote_root") or ROOT
+            self.remote_root = "/" + root.strip("/") + "/"
+            self.sub_title = f"Restore → {self.device_label}"
+        else:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            self.db = StateDB(self.out_dir / ".abu" / "state.db")
+            self.sub_title = self.device_label
         self.db.set_meta("serial", self.serial or "")
-        self.sub_title = self.device_label
 
         summary = self.db.summary()
         pending = summary.get("pending", (0, 0))
@@ -511,7 +578,8 @@ class AbuApp(App):
                 self.call_from_thread(self._resume_choice, "resume")
                 return
             text = (
-                f"[#50fa7b]{done[0]:,} files ({human_size(done[1])}) already backed up[/]\n"
+                f"[#50fa7b]{done[0]:,} files ({human_size(done[1])}) already "
+                f"{'restored' if self.mode == 'restore' else 'backed up'}[/]\n"
                 f"[#f1fa8c]{pending[0]:,} files ({human_size(pending[1])}) remaining[/]\n"
                 + (f"[#ff5555]{failed[0]:,} files failed[/]\n" if failed[0] else "")
                 + f"\n[dim]{self.out_dir}[/]"
@@ -531,7 +599,11 @@ class AbuApp(App):
             self.exit()
 
     def start_scan(self) -> None:
-        self.switch_screen(MessageScreen("Scanning /sdcard…", "Listing files on the device", loading=True))
+        if self.mode == "restore":
+            title, body = "Reading backup…", f"Comparing {self.out_dir} with the device"
+        else:
+            title, body = "Scanning /sdcard…", "Listing files on the device"
+        self.switch_screen(MessageScreen(title, body, loading=True))
         self.scan()
 
     @work(thread=True, exclusive=True)
@@ -539,12 +611,23 @@ class AbuApp(App):
         assert self.adb and self.db
         def progress(n: int) -> None:
             self.call_from_thread(self._scan_progress, n)
+        annotate = None
         try:
-            self.files = self.adb.scan(ROOT, progress)
+            if self.mode == "restore":
+                self.files = scan_local(self.out_dir)
+                if not self.files:
+                    self.call_from_thread(self.fatal, "Backup folder is empty", str(self.out_dir))
+                    return
+                remote = self.adb.scan(self.remote_root, progress)
+                self.remote_files = {f.rel: (f.size, f.mtime) for f in remote}
+                annotate = restore_annotator(self.files, self.remote_files)
+                root = build_tree(self.files, "backup")
+            else:
+                self.files = self.adb.scan(ROOT, progress)
+                root = build_tree(self.files)
         except AdbError as e:
             self.call_from_thread(self.fatal, "Scan failed", str(e))
             return
-        root = build_tree(self.files)
         previous = self.db.selected_rels()
         if previous:
             for rel in previous:
@@ -557,27 +640,63 @@ class AbuApp(App):
             if android and not self.include_android:
                 android.set_selected(False)
         self.fs_root = root
-        self.call_from_thread(self.switch_screen, SelectScreen(root))
+        self.call_from_thread(self.switch_screen, SelectScreen(root, annotate))
 
     def _scan_progress(self, n: int) -> None:
         scr = self.screen
         if isinstance(scr, MessageScreen):
-            scr.set_body(f"Found [b]{n:,}[/] files…")
+            where = "on the device" if self.mode == "restore" else ""
+            scr.set_body(f"Found [b]{n:,}[/] files {where}…")
 
-    # ------------------------------------------------------------- backup
-    def start_backup_from_selection(self) -> None:
+    # ------------------------------------------------------------- transfer
+    def start_from_selection(self) -> None:
         assert self.fs_root and self.db
-        sizes = {f.rel: f for f in self.files}
-        selected = [sizes[n.rel] for n in self.fs_root.iter_selected()]
-        self.db.plan(selected)
-        self.run_engine()
+        by_rel = {f.rel: f for f in self.files}
+        selected = [by_rel[n.rel] for n in self.fs_root.iter_selected()]
+        if self.mode == "backup":
+            self.db.plan(selected)
+            self.run_engine()
+            return
+
+        remote = self.remote_files or {}
+        same = [f for f in selected if remote.get(f.rel, (-1,))[0] == f.size]
+        differ = [f for f in selected if f.rel in remote and remote[f.rel][0] != f.size]
+        new_bytes = sum(f.size for f in selected) - sum(f.size for f in same)
+        if not self.overwrite:
+            new_bytes -= sum(f.size for f in differ)
+        body = (
+            f"Push [b]{human_size(new_bytes)}[/] to [#8be9fd]{self.remote_root}[/] on\n"
+            f"{self.device_label}.\n\n"
+            f"[#50fa7b]{len(selected) - len(same) - len(differ):,} new files[/]\n"
+            f"[#6272a4]{len(same):,} already on the device (skipped)[/]\n"
+            + (f"[#f1fa8c]{len(differ):,} differ on the device → "
+               + ("[b #ff5555]will be OVERWRITTEN[/][/]" if self.overwrite else "kept as they are[/]")
+               if differ else "")
+        )
+
+        def go(yes: bool | None) -> None:
+            if yes:
+                self.db.plan(selected)
+                self.db.set_meta("remote_root", self.remote_root)
+                self.run_engine()
+
+        self.push_screen(Confirm("Start restore?", body, "Restore", "Cancel",
+                                 yes_variant="success"), go)
 
     def run_engine(self) -> None:
         assert self.adb and self.db
-        self.engine = BackupEngine(
-            self.adb, self.db, self.out_dir, ROOT,
-            verify_hash=self.verify_hash, retries=self.retries,
-        )
+        if self.mode == "restore":
+            self.engine = RestoreEngine(
+                self.adb, self.db, self.out_dir, self.remote_root,
+                remote_files=self.remote_files, overwrite=self.overwrite,
+                verify_hash=self.verify_hash, retries=self.retries,
+            )
+            self.remote_files = None  # stale after this run; rescan on retry
+        else:
+            self.engine = BackupEngine(
+                self.adb, self.db, self.out_dir, ROOT,
+                verify_hash=self.verify_hash, retries=self.retries,
+            )
         self.switch_screen(BackupScreen(self.engine))
 
     def stop_engine_and_exit(self) -> None:
@@ -601,3 +720,40 @@ class AbuApp(App):
             self.engine.join(timeout=5)
         if self.db:
             self.db.close()
+
+
+def restore_annotator(files: list[RemoteFile],
+                      remote: dict[str, tuple[int, int]]) -> Callable[[FsNode], Text | None]:
+    """Label each tree row with how it compares to what is on the device."""
+    status: dict[str, str] = {}
+    dirs: dict[str, list[int]] = {}  # rel -> [new, same, differ]
+    for f in files:
+        r = remote.get(f.rel)
+        st = "new" if r is None else ("same" if r[0] == f.size else "differ")
+        status[f.rel] = st
+        idx = {"new": 0, "same": 1, "differ": 2}[st]
+        parts = f.rel.split("/")
+        for i in range(len(parts)):
+            dirs.setdefault("/".join(parts[:i]), [0, 0, 0])[idx] += 1
+
+    def annotate(fs: FsNode) -> Text | None:
+        if not fs.is_dir:
+            st = status.get(fs.rel)
+            if st == "same":
+                return Text("  ✓ on device", "#6272a4")
+            if st == "differ":
+                return Text("  ≠ differs on device", "#f1fa8c")
+            return Text("  new", "#50fa7b")
+        new, same, differ = dirs.get(fs.rel, [0, 0, 0])
+        t = Text()
+        if new:
+            t.append(f"  {new:,} new", "#50fa7b")
+        if differ:
+            t.append(f"  {differ:,} differ", "#f1fa8c")
+        if same and not new and not differ:
+            t.append("  ✓ all on device", "#6272a4")
+        elif same:
+            t.append(f"  {same:,} on device", "#6272a4")
+        return t
+
+    return annotate

@@ -10,7 +10,9 @@ abu/
 ├── adb.py        Wrapper around the `adb` binary: devices, scan, stat, md5, pull
 ├── model.py      In-memory folder tree (FsNode) with tri-state selection + size helpers
 ├── state.py      SQLite store of per-file status (the source of truth for resume)
-├── engine.py     BackupEngine thread: batching, pull, verify, pause, reconnect, retry
+├── engine.py     TransferEngine base (pause, reconnect, batching, adb babysitting)
+│                 + BackupEngine: pull, verify, retry
+├── restore.py    RestoreEngine: push via on-device staging, verify, mv into place
 ├── app.py        Textual UI: screens, check-tree widget, modals, wiring
 └── app.tcss      Styles for the UI
 ```
@@ -113,9 +115,29 @@ The engine sends `SIGSTOP` to the `adb pull` process and `SIGCONT` when you resu
 
 `stop()` wakes a paused process, ends the running `adb pull`, deletes the partial `.abu-part` file and leaves that file `pending`. Files in the current batch that had already arrived complete are kept, unless MD5 checking is on.
 
+## Restore
+
+`abu restore BACKUP_DIR` reuses the picker, the state store and the transfer screen. The differences are:
+
+- **Picker data.** abu walks `BACKUP_DIR` locally, skipping `.abu/` and `*.abu-part`, and also scans the phone's target folder. Each local file is classed as *new*, *same* (same size on the phone) or *differ*. Those counts are added up per folder for the picker labels.
+- **State.** Progress is kept in `BACKUP_DIR/.abu/restore.db`, with the same schema. The target folder on the phone is stored in `meta.remote_root`, so resuming goes back to the same place. There is one extra status, `conflict`. It isn't counted as unfinished work, and it is checked again on each run, so re-running with `--overwrite` picks those files up.
+- **Engine.** `RestoreEngine` subclasses `TransferEngine`, so pause, stop and disconnect handling are identical. Every job (a batch of small files from one folder, or a single large file) goes through these steps:
+
+  ```
+  rm -rf <stg> && mkdir -p <stg> && touch <stg>/.nomedia      (stg = <target>/.abu-staging/)
+  adb push f1 f2 … <stg>/                                      (progress: polls the size of <stg> every 0.5 s)
+  stat each staged file  → size must match                     (+ md5sum with --verify-hash)
+  mkdir -p <final dir> && mv -f <good staged files> <final dir>/
+  stat the final paths   → confirm they arrived
+  ```
+
+  `adb push` and `mv` both keep the modified time, which was checked on a real phone. When part of a batch fails, each remaining file is retried on its own, exactly as in a backup. When the run ends, the staging folder is removed and `content call --uri content://media --method scan_volume --arg external_primary` asks MediaProvider to index the new media.
+
+**Tested:** a generated 126 MB backup (300 small files, a 60 MB file and a 25 MB file, names with spaces and quotes) was restored into a scratch folder on the phone, with a pause, a simulated disconnect, a quit and a resume along the way. Every file's MD5 matched. The pre-existing file that differed was left untouched, and replaced only with `--overwrite`.
+
 ## Why there is no partial-file resume within a file
 
-`adb pull` can't start partway through a file. A file interrupted by a disconnect is copied again from the start. The temporary `.abu-part` name guarantees that a truncated file is never mistaken for a finished one. Pausing (`SIGSTOP`) doesn't interrupt the copy, so it never costs anything.
+Neither `adb pull` nor `adb push` can start partway through a file. A file interrupted by a disconnect is copied again from the start. The temporary `.abu-part` name guarantees that a truncated file is never mistaken for a finished one. Pausing (`SIGSTOP`) doesn't interrupt the copy, so it never costs anything.
 
 ## Testing without a cable
 
