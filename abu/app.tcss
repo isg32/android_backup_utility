@@ -1,0 +1,86 @@
+Screen {
+    background: #1e1f29;
+}
+Header {
+    background: #44475a;
+    color: #f8f8f2;
+}
+Footer {
+    background: #282a36;
+}
+
+/* ---------- message / loading ---------- */
+#msg-wrap { height: 1fr; align: center middle; }
+#msg {
+    width: 70;
+    height: auto;
+    padding: 1 3;
+    border: round #bd93f9;
+    background: #282a36;
+}
+#msg-title { text-style: bold; color: #bd93f9; width: 100%; content-align: center middle; }
+#msg LoadingIndicator { height: 3; color: #50fa7b; }
+#msg-body { width: 100%; content-align: center middle; text-align: center; color: #f8f8f2; }
+
+/* ---------- selection ---------- */
+#sel-summary {
+    height: auto;
+    padding: 1 1 0 1;
+    background: #282a36;
+    color: #f8f8f2;
+}
+#tree {
+    height: 1fr;
+    margin: 0 1;
+    border: round #6272a4;
+    background: #1e1f29;
+    padding: 0 1;
+}
+#tree:focus { border: round #bd93f9; }
+#tree > .tree--cursor { background: #44475a; text-style: none; }
+#tree:focus > .tree--cursor { background: #44475a; }
+#tree > .tree--guides { color: #44475a; }
+#tree > .tree--guides-selected { color: #bd93f9; }
+
+/* ---------- backup ---------- */
+#bk { padding: 1 2; height: 1fr; }
+#bk-top { height: auto; margin-bottom: 1; }
+#bk-state { width: auto; margin-right: 2; }
+#bk-dest { width: 1fr; }
+.bk-label { color: #bd93f9; text-style: bold; margin-top: 1; }
+ProgressBar { width: 100%; height: 1; }
+ProgressBar Bar { width: 1fr; }
+ProgressBar Bar > .bar--bar { color: #bd93f9; background: #44475a; }
+ProgressBar Bar > .bar--complete { color: #50fa7b; }
+#bar-file Bar > .bar--bar { color: #8be9fd; }
+#bk-stats, #bk-file { height: auto; color: #f8f8f2; }
+#bk-log {
+    height: 1fr;
+    margin-top: 1;
+    border: round #6272a4;
+    background: #282a36;
+    padding: 0 1;
+}
+
+/* ---------- dialogs ---------- */
+ResumeModal, DevicePicker, ConfirmQuit { align: center middle; background: #00000099; }
+#dialog {
+    width: 64;
+    height: auto;
+    padding: 1 2;
+    border: thick #bd93f9;
+    background: #282a36;
+}
+#dialog-title { text-style: bold; color: #bd93f9; margin-bottom: 1; }
+#dialog-body { margin-bottom: 1; }
+#dialog-buttons { height: auto; align: center middle; }
+#dialog-buttons Button { margin: 0 1; }
+#dialog OptionList { height: auto; max-height: 12; }
+
+* {
+    scrollbar-background: #282a36;
+    scrollbar-color: #6272a4;
+    scrollbar-color-hover: #bd93f9;
+    scrollbar-color-active: #bd93f9;
+    scrollbar-size-vertical: 1;
+}

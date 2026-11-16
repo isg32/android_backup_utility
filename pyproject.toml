@@ -1,0 +1,19 @@
+[project]
+name = "android-backup-utility"
+version = "0.1.0"
+description = "Resumable adb backup of an Android device's /sdcard, with a TUI folder picker"
+requires-python = ">=3.10"
+dependencies = ["textual>=0.80"]
+
+[project.scripts]
+abu = "abu.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["abu"]
+
+[tool.setuptools.package-data]
+abu = ["*.tcss"]
